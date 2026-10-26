@@ -19,7 +19,11 @@ export async function POST(req: Request) {
   } catch {
     return NextResponse.json({ error: "JSON invalide" }, { status: 400 });
   }
-  const { title, dates } = (body ?? {}) as { title?: unknown; dates?: unknown };
+  const { title, dates, allowProposals } = (body ?? {}) as {
+    title?: unknown;
+    dates?: unknown;
+    allowProposals?: unknown;
+  };
 
   const cleanTitle =
     (typeof title === "string" ? title.trim().slice(0, 80) : "") || "Sortie entre potes";
@@ -55,6 +59,7 @@ export async function POST(req: Request) {
       finalDate: null,
       createdAt: Date.now(),
       adminToken,
+      allowProposals: allowProposals !== false,
     });
     // Vérifie que le sondage est bien relisible avant de rediriger
     if (!(await getMeta(id))) throw new Error("relecture impossible");

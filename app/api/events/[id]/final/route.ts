@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getMeta, updateMeta } from "@/lib/store";
+import { getAllDates, getMeta, updateMeta } from "@/lib/store";
 
 /** Réservé à l'organisateur : valide (ou annule) la date finale. */
 export async function POST(req: Request, ctx: { params: Promise<{ id: string }> }) {
@@ -14,7 +14,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
   if (adminToken !== meta.adminToken) {
     return NextResponse.json({ error: "Réservé à l'organisateur" }, { status: 403 });
   }
-  if (date !== null && (typeof date !== "string" || !meta.dates.includes(date))) {
+  if (date !== null && (typeof date !== "string" || !(await getAllDates(meta)).includes(date))) {
     return NextResponse.json({ error: "Date invalide" }, { status: 400 });
   }
   await updateMeta({ ...meta, finalDate: date });

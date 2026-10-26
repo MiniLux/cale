@@ -1,6 +1,6 @@
 import { Redis as UpstashRedis } from "@upstash/redis";
 import { createClient } from "redis";
-import type { EventMeta, Participant, PublicEvent } from "./types";
+import type { EventMeta, Participant, ProposedDate, PublicEvent } from "./types";
 
 /**
  * Stockage des sondages. Fonctionne avec :
@@ -17,6 +17,7 @@ interface Store {
   get<T>(key: string): Promise<T | null>;
   set(key: string, value: unknown, ttl: number): Promise<void>;
   hset(key: string, field: string, value: unknown): Promise<void>;
+  hdel(key: string, field: string): Promise<void>;
   hgetall<T>(key: string): Promise<T[]>;
   hlen(key: string): Promise<number>;
   expire(key: string, ttl: number): Promise<void>;
@@ -37,6 +38,7 @@ function upstashStore(url: string, token: string): Store {
     hlen: (k) => r.hlen(k),
     expire: async (k, ttl) => void (await r.expire(k, ttl)),
     del: async (keys) => void (await r.del(...keys)),
+    hdel: async (k, f) => void (await r.hdel(k, f)),
   };
 }
 
@@ -76,6 +78,7 @@ function tcpStore(url: string): Store {
     hlen: async (k) => Number(await (await client()).hLen(k)),
     expire: async (k, ttl) => void (await (await client()).expire(k, ttl)),
     del: async (keys) => void (await (await client()).del(keys)),
+    hdel: async (k, f) => void (await (await client()).hDel(k, f)),
   };
 }
 
@@ -93,6 +96,7 @@ function memoryStore(): Store {
     hgetall: async <T,>(k: string) => [...(mem.h.get(k)?.values() ?? [])] as T[],
     hlen: async (k) => mem.h.get(k)?.size ?? 0,
     expire: async () => {},
+    hdel: async (k, f) => void mem.h.get(k)?.delete(f),
     del: async (keys) => {
       for (const k of keys) {
         mem.kv.delete(k);
@@ -155,6 +159,7 @@ if (storageMissing) {
 // ---------- API utilisée par l'app ----------
 const metaKey = (id: string) => `ev:${id}`;
 const partsKey = (id: string) => `ev:${id}:p`;
+const extraKey = (id: string) => `ev:${id}:x`; // dates proposées par les invités
 
 export async function createEvent(meta: EventMeta): Promise<void> {
   await db.set(metaKey(meta.id), meta, TTL_SECONDS);
@@ -170,12 +175,41 @@ export async function getParticipants(id: string): Promise<Participant[]> {
   return list.sort((a, b) => a.updatedAt - b.updatedAt);
 }
 
+export async function getProposed(id: string): Promise<ProposedDate[]> {
+  const list = await db.hgetall<ProposedDate>(extraKey(id));
+  return list.sort((a, b) => a.date.localeCompare(b.date));
+}
+
+/** Toutes les dates du sondage (organisateur + invités), triées. */
+export function mergeDates(meta: EventMeta, proposed: ProposedDate[]): string[] {
+  return [...new Set([...meta.dates, ...proposed.map((p) => p.date)])].sort();
+}
+
+export async function getAllDates(meta: EventMeta): Promise<string[]> {
+  return mergeDates(meta, await getProposed(meta.id));
+}
+
+export async function addProposed(eventId: string, items: ProposedDate[]): Promise<void> {
+  for (const it of items) await db.hset(extraKey(eventId), it.date, it);
+  await db.expire(extraKey(eventId), TTL_SECONDS);
+}
+
+export async function removeProposed(eventId: string, date: string): Promise<void> {
+  await db.hdel(extraKey(eventId), date);
+}
+
 export async function getPublicEvent(id: string): Promise<PublicEvent | null> {
   const meta = await getMeta(id);
   if (!meta) return null;
-  const participants = await getParticipants(id);
-  const { adminToken: _ignored, ...rest } = meta;
-  return { ...rest, participants };
+  const [participants, proposed] = await Promise.all([getParticipants(id), getProposed(id)]);
+  const { adminToken: _ignored, allowProposals, ...rest } = meta;
+  return {
+    ...rest,
+    dates: mergeDates(meta, proposed),
+    allowProposals: allowProposals !== false,
+    proposed,
+    participants,
+  };
 }
 
 export async function saveParticipant(eventId: string, p: Participant): Promise<void> {
@@ -183,6 +217,7 @@ export async function saveParticipant(eventId: string, p: Participant): Promise<
   await Promise.all([
     db.expire(partsKey(eventId), TTL_SECONDS),
     db.expire(metaKey(eventId), TTL_SECONDS),
+    db.expire(extraKey(eventId), TTL_SECONDS),
   ]);
 }
 
@@ -191,7 +226,7 @@ export async function countParticipants(eventId: string): Promise<number> {
 }
 
 export async function deleteEvent(id: string): Promise<void> {
-  await db.del([metaKey(id), partsKey(id)]);
+  await db.del([metaKey(id), partsKey(id), extraKey(id)]);
 }
 
 export async function updateMeta(meta: EventMeta): Promise<void> {

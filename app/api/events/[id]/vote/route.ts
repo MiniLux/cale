@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { countParticipants, getMeta, getParticipants, saveParticipant } from "@/lib/store";
+import { countParticipants, getAllDates, getMeta, getParticipants, saveParticipant } from "@/lib/store";
 import type { Vote } from "@/lib/types";
 
 const MAX_PARTICIPANTS = 60;
@@ -27,7 +27,7 @@ export async function PUT(req: Request, ctx: { params: Promise<{ id: string }> }
   const cleanName = typeof name === "string" ? name.trim().slice(0, 30) : "";
   if (!cleanName) return NextResponse.json({ error: "Prénom requis" }, { status: 400 });
 
-  const allowed = new Set(meta.dates);
+  const allowed = new Set(await getAllDates(meta));
   const cleanVotes: Record<string, Vote> = {};
   if (votes && typeof votes === "object") {
     for (const [date, v] of Object.entries(votes as Record<string, unknown>)) {

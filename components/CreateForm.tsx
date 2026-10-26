@@ -1,8 +1,9 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { addDays, longLabel, monthLabel, toKey } from "@/lib/dates";
+import { addDays, longLabel, toKey } from "@/lib/dates";
+import MonthCalendar from "./MonthCalendar";
 import {
   adminKey,
   getHistory,
@@ -11,9 +12,6 @@ import {
   removeHistory,
   type HistoryItem,
 } from "@/lib/client";
-
-const DOW = ["L", "M", "M", "J", "V", "S", "D"];
-const MAX_MONTHS_AHEAD = 11;
 
 type Preset = { label: string; build: (today: Date) => string[] };
 
@@ -53,19 +51,18 @@ const IDEAS = ["Resto", "Ciné", "Apéro", "Week-end", "Escape game", "Soirée j
 export default function CreateForm() {
   const router = useRouter();
   const [today, setToday] = useState<Date | null>(null);
-  const [cursor, setCursor] = useState<Date | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [title, setTitle] = useState("");
   const [placeholder, setPlaceholder] = useState("Resto, ciné, week-end…");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [history, setHistory] = useState<HistoryItem[]>([]);
+  const [allowProposals, setAllowProposals] = useState(true);
 
   useEffect(() => {
     const now = new Date();
     const t = new Date(now.getFullYear(), now.getMonth(), now.getDate());
     setToday(t);
-    setCursor(new Date(t.getFullYear(), t.getMonth(), 1));
     setHistory(getHistory());
     let i = 0;
     const timer = setInterval(() => {
@@ -74,18 +71,6 @@ export default function CreateForm() {
     }, 2200);
     return () => clearInterval(timer);
   }, []);
-
-  const todayK = today ? toKey(today) : "";
-
-  const cells = useMemo(() => {
-    if (!cursor) return [];
-    const first = new Date(cursor.getFullYear(), cursor.getMonth(), 1);
-    const offset = (first.getDay() + 6) % 7; // lundi = 0
-    const daysInMonth = new Date(cursor.getFullYear(), cursor.getMonth() + 1, 0).getDate();
-    const out: (Date | null)[] = Array(offset).fill(null);
-    for (let d = 1; d <= daysInMonth; d++) out.push(new Date(cursor.getFullYear(), cursor.getMonth(), d));
-    return out;
-  }, [cursor]);
 
   function toggle(key: string) {
     setError("");
@@ -109,11 +94,6 @@ export default function CreateForm() {
     });
   }
 
-  function moveMonth(delta: number) {
-    if (!cursor) return;
-    setCursor(new Date(cursor.getFullYear(), cursor.getMonth() + delta, 1));
-  }
-
   async function submit() {
     if (selected.size === 0) {
       setError("Choisis au moins une date dans le calendrier 👆");
@@ -125,7 +105,7 @@ export default function CreateForm() {
       const res = await fetch("/api/events", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title, dates: [...selected] }),
+        body: JSON.stringify({ title, dates: [...selected], allowProposals }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Erreur");
@@ -144,8 +124,6 @@ export default function CreateForm() {
     const keys = p.build(today);
     return keys.length > 0 && keys.every((k) => selected.has(k));
   };
-  const minMonth = today ? new Date(today.getFullYear(), today.getMonth(), 1) : null;
-  const maxMonth = today ? new Date(today.getFullYear(), today.getMonth() + MAX_MONTHS_AHEAD, 1) : null;
 
   return (
     <>
@@ -183,60 +161,7 @@ export default function CreateForm() {
           ))}
         </div>
 
-        {cursor && today ? (
-          <>
-            <div className="cal-head">
-              <button
-                type="button"
-                className="cal-nav"
-                aria-label="Mois précédent"
-                onClick={() => moveMonth(-1)}
-                disabled={!!minMonth && cursor <= minMonth}
-              >
-                ‹
-              </button>
-              <strong>{monthLabel(cursor)}</strong>
-              <button
-                type="button"
-                className="cal-nav"
-                aria-label="Mois suivant"
-                onClick={() => moveMonth(1)}
-                disabled={!!maxMonth && cursor >= maxMonth}
-              >
-                ›
-              </button>
-            </div>
-            <div className="cal-grid" role="grid">
-              {DOW.map((d, i) => (
-                <div key={i} className="cal-dow">
-                  {d}
-                </div>
-              ))}
-              {cells.map((d, i) => {
-                if (!d) return <div key={`e${i}`} />;
-                const k = toKey(d);
-                const past = k < todayK;
-                const on = selected.has(k);
-                const we = d.getDay() === 0 || d.getDay() === 6;
-                return (
-                  <button
-                    key={k}
-                    type="button"
-                    disabled={past}
-                    aria-pressed={on}
-                    aria-label={longLabel(k)}
-                    className={`cal-day ${on ? "on" : ""} ${we ? "weekend" : ""} ${k === todayK ? "today" : ""}`}
-                    onClick={() => toggle(k)}
-                  >
-                    {d.getDate()}
-                  </button>
-                );
-              })}
-            </div>
-          </>
-        ) : (
-          <div style={{ height: 320 }} />
-        )}
+        <MonthCalendar selected={selected} onToggle={toggle} />
 
         <p className="hint">
           {sorted.length === 0
@@ -253,6 +178,19 @@ export default function CreateForm() {
             </>
           )}
         </p>
+
+        <label className="switch-row">
+          <span>
+            <b>Les invités peuvent proposer d&apos;autres dates</b>
+            <small>Pratique si aucune de tes dates ne convient. Modifiable plus tard.</small>
+          </span>
+          <input
+            type="checkbox"
+            className="switch"
+            checked={allowProposals}
+            onChange={(e) => setAllowProposals(e.target.checked)}
+          />
+        </label>
       </div>
 
       {history.length > 0 && (

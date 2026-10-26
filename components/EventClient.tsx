@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Brand from "./Brand";
 import { Avatar, AvatarStack } from "./Avatars";
+import MonthCalendar from "./MonthCalendar";
 import {
   adminKey,
   lastName,
@@ -17,7 +18,7 @@ import {
 } from "@/lib/client";
 import { fromKey, longLabel, monthLabel, shortLabel, todayKey, weekdayShort } from "@/lib/dates";
 import { computeStats, rankStats } from "@/lib/ranking";
-import type { Participant, PublicEvent, Vote } from "@/lib/types";
+import type { Participant, ProposedDate, PublicEvent, Vote } from "@/lib/types";
 
 type SaveState = "idle" | "saving" | "saved" | "error";
 
@@ -37,6 +38,9 @@ export default function EventClient({ initial }: { initial: PublicEvent }) {
   const [deleted, setDeleted] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [proposeOpen, setProposeOpen] = useState(false);
+  const [proposeSel, setProposeSel] = useState<Set<string>>(new Set());
+  const [proposing, setProposing] = useState(false);
 
   const whoRef = useRef<HTMLDivElement>(null);
   const nameRef = useRef<HTMLInputElement>(null);
@@ -262,6 +266,102 @@ export default function EventClient({ initial }: { initial: PublicEvent }) {
     }
   }
 
+  // ---------- Dates proposées par les invités ----------
+  function openPropose() {
+    if (!me) return askName();
+    setProposeSel(new Set());
+    setProposeOpen(true);
+    setTimeout(
+      () => document.getElementById("propose")?.scrollIntoView({ behavior: "smooth", block: "start" }),
+      50
+    );
+  }
+
+  function toggleProposeSel(key: string) {
+    setProposeSel((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }
+
+  async function submitProposals() {
+    if (!me || proposeSel.size === 0) return;
+    setProposing(true);
+    try {
+      const res = await fetch(`/api/events/${id}/dates`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          pid: me.pid,
+          name: me.name,
+          dates: [...proposeSel],
+          adminToken: adminToken ?? undefined,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error);
+      setEvent(data.event as PublicEvent);
+      // Celui qui propose une date est dispo ce jour-là
+      const next = { ...myVotes };
+      for (const d of data.added as string[]) next[d] = "yes";
+      setMyVotes(next);
+      scheduleSave(me, next);
+      setProposeOpen(false);
+      setProposeSel(new Set());
+      const n = (data.added as string[]).length;
+      flash(n > 1 ? `${n} dates ajoutées ✓` : "Date ajoutée ✓");
+      setTimeout(
+        () =>
+          document
+            .querySelector(`[data-date="${(data.added as string[])[0]}"]`)
+            ?.scrollIntoView({ behavior: "smooth", block: "center" }),
+        100
+      );
+    } catch (e) {
+      flash(e instanceof Error && e.message ? e.message : "Oups, réessaie");
+    } finally {
+      setProposing(false);
+    }
+  }
+
+  async function removeProposal(date: string) {
+    try {
+      const res = await fetch(`/api/events/${id}/dates`, {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ date, pid: me?.pid, adminToken: adminToken ?? undefined }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error);
+      setEvent(data.event as PublicEvent);
+      if (myVotes[date] && me) {
+        const next = { ...myVotes };
+        delete next[date];
+        setMyVotes(next);
+        scheduleSave(me, next);
+      }
+      flash("Date retirée");
+    } catch (e) {
+      flash(e instanceof Error && e.message ? e.message : "Oups, réessaie");
+    }
+  }
+
+  async function setAllowProposals(value: boolean) {
+    if (!adminToken) return;
+    setEvent((ev) => ({ ...ev, allowProposals: value }));
+    const res = await fetch(`/api/events/${id}/settings`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ adminToken, allowProposals: value }),
+    });
+    if (!res.ok) {
+      setEvent((ev) => ({ ...ev, allowProposals: !value }));
+      flash("Réglage non enregistré, réessaie");
+    }
+  }
+
   async function copyAdminLink() {
     if (!adminToken) return;
     try {
@@ -290,6 +390,12 @@ export default function EventClient({ initial }: { initial: PublicEvent }) {
   const visibleDates = stats.filter((s) => !today || s.date >= today || s.date === event.finalDate);
   const pastCount = stats.length - visibleDates.length;
   const showShareCard = mounted && (isNew || (isAdmin && event.participants.length < 2));
+  const proposedMap = new Map<string, ProposedDate>((event.proposed ?? []).map((p) => [p.date, p]));
+  const myProposals = (event.proposed ?? []).filter((p) => p.pid === me?.pid);
+  const canPropose = (event.allowProposals || isAdmin) && !event.finalDate;
+  // "Nouveau" = date proposée par quelqu'un d'autre depuis ma dernière réponse
+  const lastAnswerAt = event.participants.find((p) => p.id === me?.pid)?.updatedAt ?? 0;
+  const allDatesSet = useMemo(() => new Set(event.dates), [event.dates]);
 
   // ---------- Rendu ----------
   if (deleted) {
@@ -454,6 +560,9 @@ export default function EventClient({ initial }: { initial: PublicEvent }) {
           const isLeader = leader?.date === s.date && total > 1 && !event.finalDate;
           const yesPct = total ? (s.yes.length / total) * 100 : 0;
           const maybePct = total ? (s.maybe.length / total) * 100 : 0;
+          const prop = proposedMap.get(s.date);
+          const isFresh =
+            !!prop && !!me && lastAnswerAt > 0 && prop.pid !== me.pid && prop.at > lastAnswerAt && !mine;
           return (
             <div key={s.date} style={{ display: "contents" }}>
               {newMonth && visibleDates.length > 4 && <div className="month-sep">{monthLabel(d)}</div>}
@@ -477,6 +586,12 @@ export default function EventClient({ initial }: { initial: PublicEvent }) {
                       {event.finalDate === s.date && <span className="final-tag">Calé</span>}
                       {isLeader && <span className="crown" title="Meilleure date">🏆</span>}
                     </span>
+                    {prop && (
+                      <span className="proposed-by">
+                        ＋ proposée par {prop.pid === me?.pid ? "toi" : prop.by}
+                        {isFresh && <span className="new-tag">Nouveau</span>}
+                      </span>
+                    )}
                     <span className="date-who">
                       <AvatarStack yes={s.yes} maybe={s.maybe} />
                       {s.yes.length + s.maybe.length === 0
@@ -520,6 +635,67 @@ export default function EventClient({ initial }: { initial: PublicEvent }) {
           </p>
         )}
       </div>
+
+      {/* Proposer d'autres dates */}
+      {canPropose && mounted && (
+        <div id="propose" style={{ marginTop: 14, scrollMarginTop: 16 }}>
+          {!proposeOpen ? (
+            <button className="propose-btn" onClick={openPropose}>
+              <span className="plus">＋</span>
+              <span>
+                <b>Proposer une autre date</b>
+                <small>Aucune ne te va ? Ajoute la tienne, tes potes pourront voter.</small>
+              </span>
+            </button>
+          ) : (
+            <div className="card">
+              <p className="step-label" style={{ marginBottom: 4 }}>
+                Proposer une date
+              </p>
+              <p className="hint" style={{ margin: "0 0 12px" }}>
+                Tape sur un ou plusieurs jours. Les dates déjà proposées sont barrées.
+              </p>
+              <MonthCalendar
+                selected={proposeSel}
+                onToggle={toggleProposeSel}
+                taken={allDatesSet}
+                startKey={event.dates[0]}
+              />
+              <div className="btn-row" style={{ marginTop: 14 }}>
+                <button className="btn btn-ghost" onClick={() => setProposeOpen(false)} disabled={proposing}>
+                  Annuler
+                </button>
+                <button
+                  className="btn btn-primary"
+                  onClick={submitProposals}
+                  disabled={proposeSel.size === 0 || proposing}
+                >
+                  {proposing
+                    ? "Ajout…"
+                    : proposeSel.size === 0
+                      ? "Choisis une date"
+                      : `Ajouter ${proposeSel.size} date${proposeSel.size > 1 ? "s" : ""}`}
+                </button>
+              </div>
+            </div>
+          )}
+          {myProposals.length > 0 && (
+            <div className="my-proposals">
+              <span className="muted small">Tes propositions :</span>
+              {myProposals.map((p) => (
+                <span key={p.date} className="prop-chip">
+                  {shortLabel(p.date)}
+                  {p.date !== event.finalDate && (
+                    <button aria-label={`Retirer ${longLabel(p.date)}`} onClick={() => removeProposal(p.date)}>
+                      ×
+                    </button>
+                  )}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Détail */}
       {total > 1 && (
@@ -579,6 +755,33 @@ export default function EventClient({ initial }: { initial: PublicEvent }) {
             </button>{" "}
             pour le gérer depuis un autre appareil.
           </p>
+          <label className="switch-row" style={{ marginTop: 14 }}>
+            <span>
+              <b>Les invités peuvent proposer des dates</b>
+              <small>{event.allowProposals ? "Activé" : "Désactivé : seules tes dates sont proposées"}</small>
+            </span>
+            <input
+              type="checkbox"
+              className="switch"
+              checked={event.allowProposals}
+              onChange={(e) => setAllowProposals(e.target.checked)}
+            />
+          </label>
+          {(event.proposed ?? []).some((p) => p.pid !== me?.pid) && (
+            <div className="my-proposals" style={{ marginTop: 12 }}>
+              <span className="muted small">Proposées par les invités :</span>
+              {(event.proposed ?? [])
+                .filter((p) => p.pid !== me?.pid)
+                .map((p) => (
+                  <span key={p.date} className="prop-chip">
+                    {shortLabel(p.date)} · {p.by}
+                    <button aria-label={`Retirer ${longLabel(p.date)}`} onClick={() => removeProposal(p.date)}>
+                      ×
+                    </button>
+                  </span>
+                ))}
+            </div>
+          )}
           {!confirmDelete ? (
             <button className="btn btn-danger-ghost btn-sm" style={{ marginTop: 14 }} onClick={() => setConfirmDelete(true)}>
               Supprimer le sondage

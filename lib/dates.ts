@@ -64,3 +64,10 @@ export function isValidDateKey(key: string): boolean {
   const d = fromKey(key);
   return toKey(d) === key;
 }
+
+/** Plus ancienne date acceptée par le serveur : hier en UTC (tolère les fuseaux horaires). */
+export function minAcceptedKey(): string {
+  const d = new Date();
+  d.setUTCDate(d.getUTCDate() - 1);
+  return d.toISOString().slice(0, 10);
+}
