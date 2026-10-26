@@ -1,97 +1,162 @@
-import { Redis } from "@upstash/redis";
+import { Redis as UpstashRedis } from "@upstash/redis";
+import { createClient } from "redis";
 import type { EventMeta, Participant, PublicEvent } from "./types";
 
 /**
- * Stockage : Upstash Redis (via l'intégration Vercel Marketplace) si les
- * variables d'environnement sont présentes, sinon un stockage en mémoire
- * pratique pour le développement local.
+ * Stockage des sondages. Fonctionne avec :
+ * - Upstash Redis (API REST) : KV_REST_API_URL / KV_REST_API_TOKEN,
+ *   UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN (préfixe perso accepté)
+ * - n'importe quel Redis classique (Redis Cloud, Upstash…) via une URL
+ *   redis:// ou rediss:// : REDIS_URL, KV_URL, STORAGE_URL… peu importe le nom
+ * - sinon, en local uniquement, un stockage en mémoire.
  */
 const TTL_SECONDS = 60 * 60 * 24 * 120; // les sondages expirent après 120 jours
 
-/**
- * Trouve les identifiants Upstash quel que soit le nom des variables :
- * - KV_REST_API_URL / KV_REST_API_TOKEN (intégration Vercel), éventuellement
- *   avec un préfixe personnalisé (ex. STORAGE_KV_REST_API_URL)
- * - UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN (console Upstash)
- * - REDIS_URL / KV_URL au format rediss://default:TOKEN@host:6379 (Upstash)
- */
-function findCredentials(): { url: string; token: string } | null {
+/** Opérations minimales dont l'app a besoin. Les valeurs sont stockées en JSON. */
+interface Store {
+  get<T>(key: string): Promise<T | null>;
+  set(key: string, value: unknown, ttl: number): Promise<void>;
+  hset(key: string, field: string, value: unknown): Promise<void>;
+  hgetall<T>(key: string): Promise<T[]>;
+  hlen(key: string): Promise<number>;
+  expire(key: string, ttl: number): Promise<void>;
+}
+
+// ---------- Upstash (REST) ----------
+function upstashStore(url: string, token: string): Store {
+  const r = new UpstashRedis({ url, token });
+  return {
+    get: async <T,>(k: string) => (await r.get<T>(k)) ?? null,
+    set: async (k, v, ttl) => void (await r.set(k, v, { ex: ttl })),
+    hset: async (k, f, v) => void (await r.hset(k, { [f]: v })),
+    hgetall: async <T,>(k: string) => {
+      const all = await r.hgetall<Record<string, T>>(k);
+      return all ? Object.values(all) : [];
+    },
+    hlen: (k) => r.hlen(k),
+    expire: async (k, ttl) => void (await r.expire(k, ttl)),
+  };
+}
+
+// ---------- Redis classique (TCP) ----------
+type TcpClient = ReturnType<typeof createClient>;
+const g = globalThis as unknown as { __caleTcp?: Promise<TcpClient>; __caleMem?: Mem };
+
+function tcpStore(url: string): Store {
+  const client = async (): Promise<TcpClient> => {
+    if (!g.__caleTcp) {
+      const c = createClient({ url, socket: { connectTimeout: 8000 } });
+      c.on("error", (e) => console.error("[cale] Redis :", e?.message ?? e));
+      g.__caleTcp = c.connect().then(() => c);
+      g.__caleTcp.catch(() => (g.__caleTcp = undefined)); // on réessaiera au prochain appel
+    }
+    return g.__caleTcp;
+  };
+  const parse = <T,>(s: string | null | undefined): T | null => {
+    if (s == null) return null;
+    try {
+      return JSON.parse(s) as T;
+    } catch {
+      return null;
+    }
+  };
+  return {
+    get: async <T,>(k: string) => parse<T>((await (await client()).get(k)) as string | null),
+    set: async (k, v, ttl) => void (await (await client()).set(k, JSON.stringify(v), { EX: ttl })),
+    hset: async (k, f, v) => void (await (await client()).hSet(k, f, JSON.stringify(v))),
+    hgetall: async <T,>(k: string) => {
+      const all = (await (await client()).hGetAll(k)) as Record<string, string>;
+      return Object.values(all ?? {})
+        .map((s) => parse<T>(s))
+        .filter((x): x is T => x !== null);
+    },
+    hlen: async (k) => Number(await (await client()).hLen(k)),
+    expire: async (k, ttl) => void (await (await client()).expire(k, ttl)),
+  };
+}
+
+// ---------- Mémoire (dev local) ----------
+type Mem = { kv: Map<string, unknown>; h: Map<string, Map<string, unknown>> };
+function memoryStore(): Store {
+  const mem: Mem = (g.__caleMem ??= { kv: new Map(), h: new Map() });
+  return {
+    get: async <T,>(k: string) => (mem.kv.get(k) as T) ?? null,
+    set: async (k, v) => void mem.kv.set(k, v),
+    hset: async (k, f, v) => {
+      if (!mem.h.has(k)) mem.h.set(k, new Map());
+      mem.h.get(k)!.set(f, v);
+    },
+    hgetall: async <T,>(k: string) => [...(mem.h.get(k)?.values() ?? [])] as T[],
+    hlen: async (k) => mem.h.get(k)?.size ?? 0,
+    expire: async () => {},
+  };
+}
+
+// ---------- Détection automatique ----------
+type Detected = { kind: "upstash" | "redis" | "memory"; source: string; store: Store };
+
+function detect(): Detected {
   const env = process.env;
+
+  // 1. Paires REST Upstash, avec ou sans préfixe
   const pairs: [string, string][] = [
     ["KV_REST_API_URL", "KV_REST_API_TOKEN"],
     ["UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_TOKEN"],
   ];
   for (const [u, t] of pairs) {
-    if (env[u] && env[t]) return { url: env[u]!, token: env[t]! };
-    // même chose avec un préfixe personnalisé
     for (const key of Object.keys(env)) {
-      if (key.endsWith(`_${u}`)) {
-        const prefix = key.slice(0, -u.length);
-        const tok = env[`${prefix}${t}`];
-        if (env[key] && tok) return { url: env[key]!, token: tok };
+      if (key === u || key.endsWith(`_${u}`)) {
+        const tokenKey = key.slice(0, key.length - u.length) + t;
+        if (env[key] && env[tokenKey]) {
+          return { kind: "upstash", source: key, store: upstashStore(env[key]!, env[tokenKey]!) };
+        }
       }
     }
   }
-  // URL Redis classique d'Upstash → on en déduit l'URL REST et le token
-  const redisUrlKey = Object.keys(env).find(
-    (k) => (k === "REDIS_URL" || k === "KV_URL" || k.endsWith("_REDIS_URL") || k.endsWith("_KV_URL")) && env[k]
+
+  // 2. N'importe quelle variable contenant une URL redis:// ou rediss://
+  const preferred = ["REDIS_URL", "KV_URL"];
+  const keys = Object.keys(env).sort(
+    (a, b) => Number(preferred.includes(b)) - Number(preferred.includes(a))
   );
-  if (redisUrlKey) {
-    try {
-      const u = new URL(env[redisUrlKey]!);
-      if (u.hostname.endsWith("upstash.io") && u.password) {
-        return { url: `https://${u.hostname}`, token: decodeURIComponent(u.password) };
-      }
-    } catch {
-      /* URL invalide */
+  for (const key of keys) {
+    const val = env[key];
+    if (val && /^rediss?:\/\//.test(val)) {
+      return { kind: "redis", source: key, store: tcpStore(val) };
     }
   }
-  return null;
+
+  return { kind: "memory", source: "", store: memoryStore() };
 }
 
-const creds = findCredentials();
-const redis = creds ? new Redis({ url: creds.url, token: creds.token }) : null;
+const detected = detect();
+const db = detected.store;
 
 /** En production sur Vercel, la mémoire n'est pas partagée entre les serveurs : Redis est obligatoire. */
-export const storageMissing = !redis && process.env.VERCEL === "1";
+export const storageMissing = detected.kind === "memory" && process.env.VERCEL === "1";
 
 if (storageMissing) {
   console.error(
     "[cale] Aucune base Redis trouvée dans les variables d'environnement. " +
-      "Ajoute Upstash Redis depuis l'onglet Storage de ton projet Vercel, puis redéploie."
+      "Connecte une base Redis au projet (onglet Storage), puis redéploie."
   );
 }
 
-type Mem = { meta: Map<string, EventMeta>; parts: Map<string, Map<string, Participant>> };
-const g = globalThis as unknown as { __caleMem?: Mem };
-const mem: Mem = (g.__caleMem ??= { meta: new Map(), parts: new Map() });
-
+// ---------- API utilisée par l'app ----------
 const metaKey = (id: string) => `ev:${id}`;
 const partsKey = (id: string) => `ev:${id}:p`;
 
 export async function createEvent(meta: EventMeta): Promise<void> {
-  if (redis) {
-    await redis.set(metaKey(meta.id), meta, { ex: TTL_SECONDS });
-  } else {
-    mem.meta.set(meta.id, meta);
-    mem.parts.set(meta.id, new Map());
-  }
+  await db.set(metaKey(meta.id), meta, TTL_SECONDS);
 }
 
 export async function getMeta(id: string): Promise<EventMeta | null> {
   if (!/^[A-Za-z0-9]{6,16}$/.test(id)) return null;
-  if (redis) return (await redis.get<EventMeta>(metaKey(id))) ?? null;
-  return mem.meta.get(id) ?? null;
+  return db.get<EventMeta>(metaKey(id));
 }
 
 export async function getParticipants(id: string): Promise<Participant[]> {
-  let list: Participant[];
-  if (redis) {
-    const all = await redis.hgetall<Record<string, Participant>>(partsKey(id));
-    list = all ? Object.values(all) : [];
-  } else {
-    list = [...(mem.parts.get(id)?.values() ?? [])];
-  }
+  const list = await db.hgetall<Participant>(partsKey(id));
   return list.sort((a, b) => a.updatedAt - b.updatedAt);
 }
 
@@ -104,36 +169,53 @@ export async function getPublicEvent(id: string): Promise<PublicEvent | null> {
 }
 
 export async function saveParticipant(eventId: string, p: Participant): Promise<void> {
-  if (redis) {
-    await redis.hset(partsKey(eventId), { [p.id]: p });
-    await Promise.all([
-      redis.expire(partsKey(eventId), TTL_SECONDS),
-      redis.expire(metaKey(eventId), TTL_SECONDS),
-    ]);
-  } else {
-    if (!mem.parts.has(eventId)) mem.parts.set(eventId, new Map());
-    mem.parts.get(eventId)!.set(p.id, p);
-  }
+  await db.hset(partsKey(eventId), p.id, p);
+  await Promise.all([
+    db.expire(partsKey(eventId), TTL_SECONDS),
+    db.expire(metaKey(eventId), TTL_SECONDS),
+  ]);
 }
 
 export async function countParticipants(eventId: string): Promise<number> {
-  if (redis) return await redis.hlen(partsKey(eventId));
-  return mem.parts.get(eventId)?.size ?? 0;
+  return db.hlen(partsKey(eventId));
 }
 
 export async function updateMeta(meta: EventMeta): Promise<void> {
-  if (redis) await redis.set(metaKey(meta.id), meta, { ex: TTL_SECONDS });
-  else mem.meta.set(meta.id, meta);
+  await db.set(metaKey(meta.id), meta, TTL_SECONDS);
 }
 
-/** Diagnostic : type de stockage et test d'écriture/lecture. */
-export async function healthCheck(): Promise<{ storage: "redis" | "memory"; ok: boolean; error?: string }> {
-  if (!redis) return { storage: "memory", ok: !storageMissing, error: storageMissing ? "Aucune variable Redis trouvée" : undefined };
+/** Diagnostic (/api/health) : quel stockage est utilisé, et test écriture/lecture. */
+export async function healthCheck(): Promise<{
+  storage: Detected["kind"];
+  variable?: string;
+  ok: boolean;
+  error?: string;
+  hint?: string;
+}> {
+  if (detected.kind === "memory") {
+    // Uniquement les NOMS des variables (jamais les valeurs) pour aider au diagnostic
+    const related = Object.keys(process.env).filter((k) => /REDIS|KV|UPSTASH|STORAGE/i.test(k));
+    return {
+      storage: "memory",
+      ok: !storageMissing,
+      error: storageMissing ? "Aucune variable Redis trouvée" : undefined,
+      hint: storageMissing
+        ? related.length
+          ? `Variables vues : ${related.join(", ")}`
+          : "Aucune variable liée à Redis : connecte la base au projet puis fais un Redeploy."
+        : undefined,
+    };
+  }
   try {
-    await redis.set("cale:health", Date.now(), { ex: 60 });
-    const v = await redis.get("cale:health");
-    return { storage: "redis", ok: v != null };
+    await db.set("cale:health", { t: Date.now() }, 60);
+    const v = await db.get("cale:health");
+    return { storage: detected.kind, variable: detected.source, ok: v != null };
   } catch (e) {
-    return { storage: "redis", ok: false, error: e instanceof Error ? e.message : String(e) };
+    return {
+      storage: detected.kind,
+      variable: detected.source,
+      ok: false,
+      error: e instanceof Error ? e.message : String(e),
+    };
   }
 }
