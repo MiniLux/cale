@@ -42,6 +42,24 @@ export function pushHistory(item: HistoryItem): void {
   lsSet(HISTORY_KEY, list.slice(0, 12));
 }
 
+export function removeHistory(id: string): void {
+  lsSet(
+    HISTORY_KEY,
+    getHistory().filter((h) => h.id !== id)
+  );
+}
+
+/** Oublie tout ce que ce navigateur sait d'un sondage (après suppression). */
+export function forgetEvent(id: string): void {
+  removeHistory(id);
+  try {
+    localStorage.removeItem(adminKey(id));
+    localStorage.removeItem(meKey(id));
+  } catch {
+    /* ignore */
+  }
+}
+
 export function lastName(): string {
   return lsGet<string>("cale:lastName", "");
 }

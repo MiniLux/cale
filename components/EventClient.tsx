@@ -10,6 +10,7 @@ import {
   lsSet,
   meKey,
   newPid,
+  forgetEvent,
   pushHistory,
   saveLastName,
   type Me,
@@ -33,6 +34,9 @@ export default function EventClient({ initial }: { initial: PublicEvent }) {
   const [toast, setToast] = useState("");
   const [mounted, setMounted] = useState(false);
   const [today, setToday] = useState("");
+  const [deleted, setDeleted] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleting, setDeleting] = useState(false);
 
   const whoRef = useRef<HTMLDivElement>(null);
   const nameRef = useRef<HTMLInputElement>(null);
@@ -78,6 +82,7 @@ export default function EventClient({ initial }: { initial: PublicEvent }) {
     try {
       const res = await fetch(`/api/events/${id}`, { cache: "no-store" });
       if (res.ok) setEvent(await res.json());
+      else if (res.status === 404) setDeleted(true);
     } catch {
       /* hors ligne : on réessaiera */
     }
@@ -237,6 +242,26 @@ export default function EventClient({ initial }: { initial: PublicEvent }) {
     }
   }
 
+  async function deletePoll() {
+    if (!adminToken) return;
+    setDeleting(true);
+    try {
+      const res = await fetch(`/api/events/${id}`, {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ adminToken }),
+      });
+      if (!res.ok) throw new Error((await res.json()).error);
+      forgetEvent(id);
+      setDeleted(true);
+      window.scrollTo({ top: 0 });
+    } catch (e) {
+      flash(e instanceof Error && e.message ? e.message : "Suppression impossible, réessaie");
+      setDeleting(false);
+      setConfirmDelete(false);
+    }
+  }
+
   async function copyAdminLink() {
     if (!adminToken) return;
     try {
@@ -267,6 +292,21 @@ export default function EventClient({ initial }: { initial: PublicEvent }) {
   const showShareCard = mounted && (isNew || (isAdmin && event.participants.length < 2));
 
   // ---------- Rendu ----------
+  if (deleted) {
+    return (
+      <main className="wrap">
+        <Brand />
+        <section className="hero">
+          <h1>Sondage supprimé</h1>
+          <p>« {event.title} » et toutes les réponses ont été effacés.</p>
+        </section>
+        <a href="/" className="btn btn-primary btn-block">
+          Créer un nouveau sondage
+        </a>
+      </main>
+    );
+  }
+
   return (
     <main className="wrap">
       {toast && <div className="toast" role="status">{toast}</div>}
@@ -528,13 +568,37 @@ export default function EventClient({ initial }: { initial: PublicEvent }) {
       )}
 
       {isAdmin && (
-        <p className="hint center" style={{ marginTop: 24 }}>
-          Tu es l&apos;organisateur sur cet appareil.{" "}
-          <button className="link-btn" onClick={copyAdminLink}>
-            Copier mon lien organisateur
-          </button>{" "}
-          (pour valider depuis un autre appareil).
-        </p>
+        <div className="card admin-zone">
+          <p className="step-label" style={{ marginBottom: 6 }}>
+            Organisateur
+          </p>
+          <p className="hint" style={{ marginTop: 0 }}>
+            Tu gères ce sondage depuis cet appareil.{" "}
+            <button className="link-btn" onClick={copyAdminLink}>
+              Copier mon lien organisateur
+            </button>{" "}
+            pour le gérer depuis un autre appareil.
+          </p>
+          {!confirmDelete ? (
+            <button className="btn btn-danger-ghost btn-sm" style={{ marginTop: 14 }} onClick={() => setConfirmDelete(true)}>
+              Supprimer le sondage
+            </button>
+          ) : (
+            <div className="confirm-box">
+              <p>
+                <b>Supprimer définitivement ?</b> Les réponses de tout le monde seront effacées et le lien ne marchera plus.
+              </p>
+              <div className="btn-row">
+                <button className="btn btn-ghost btn-sm" onClick={() => setConfirmDelete(false)} disabled={deleting}>
+                  Annuler
+                </button>
+                <button className="btn btn-danger btn-sm" onClick={deletePoll} disabled={deleting}>
+                  {deleting ? "Suppression…" : "Oui, supprimer"}
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
       )}
 
       {/* Barre du bas */}

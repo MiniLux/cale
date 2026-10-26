@@ -20,6 +20,7 @@ interface Store {
   hgetall<T>(key: string): Promise<T[]>;
   hlen(key: string): Promise<number>;
   expire(key: string, ttl: number): Promise<void>;
+  del(keys: string[]): Promise<void>;
 }
 
 // ---------- Upstash (REST) ----------
@@ -35,6 +36,7 @@ function upstashStore(url: string, token: string): Store {
     },
     hlen: (k) => r.hlen(k),
     expire: async (k, ttl) => void (await r.expire(k, ttl)),
+    del: async (keys) => void (await r.del(...keys)),
   };
 }
 
@@ -45,7 +47,8 @@ const g = globalThis as unknown as { __caleTcp?: Promise<TcpClient>; __caleMem?:
 function tcpStore(url: string): Store {
   const client = async (): Promise<TcpClient> => {
     if (!g.__caleTcp) {
-      const c = createClient({ url, socket: { connectTimeout: 8000 } });
+      // disableOfflineQueue : si Redis est injoignable, on échoue tout de suite (message clair) au lieu de rester bloqué
+      const c = createClient({ url, disableOfflineQueue: true, socket: { connectTimeout: 8000 } });
       c.on("error", (e) => console.error("[cale] Redis :", e?.message ?? e));
       g.__caleTcp = c.connect().then(() => c);
       g.__caleTcp.catch(() => (g.__caleTcp = undefined)); // on réessaiera au prochain appel
@@ -72,6 +75,7 @@ function tcpStore(url: string): Store {
     },
     hlen: async (k) => Number(await (await client()).hLen(k)),
     expire: async (k, ttl) => void (await (await client()).expire(k, ttl)),
+    del: async (keys) => void (await (await client()).del(keys)),
   };
 }
 
@@ -89,6 +93,12 @@ function memoryStore(): Store {
     hgetall: async <T,>(k: string) => [...(mem.h.get(k)?.values() ?? [])] as T[],
     hlen: async (k) => mem.h.get(k)?.size ?? 0,
     expire: async () => {},
+    del: async (keys) => {
+      for (const k of keys) {
+        mem.kv.delete(k);
+        mem.h.delete(k);
+      }
+    },
   };
 }
 
@@ -178,6 +188,10 @@ export async function saveParticipant(eventId: string, p: Participant): Promise<
 
 export async function countParticipants(eventId: string): Promise<number> {
   return db.hlen(partsKey(eventId));
+}
+
+export async function deleteEvent(id: string): Promise<void> {
+  await db.del([metaKey(id), partsKey(id)]);
 }
 
 export async function updateMeta(meta: EventMeta): Promise<void> {

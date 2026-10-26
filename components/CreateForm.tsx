@@ -3,7 +3,14 @@
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { addDays, longLabel, monthLabel, toKey } from "@/lib/dates";
-import { adminKey, getHistory, lsSet, pushHistory, type HistoryItem } from "@/lib/client";
+import {
+  adminKey,
+  getHistory,
+  lsSet,
+  pushHistory,
+  removeHistory,
+  type HistoryItem,
+} from "@/lib/client";
 
 const DOW = ["L", "M", "M", "J", "V", "S", "D"];
 const MAX_MONTHS_AHEAD = 11;
@@ -35,6 +42,7 @@ const PRESETS: Preset[] = [
     },
   },
   { label: "Les 7 prochains jours", build: (t) => nextDays(t, 7, [0, 1, 2, 3, 4, 5, 6]) },
+  { label: "Jeudis", build: (t) => nextDays(t, 28, [4]) },
   { label: "Vendredis & samedis", build: (t) => nextDays(t, 28, [5, 6]) },
   { label: "Les week-ends du mois", build: (t) => nextDays(t, 28, [6, 0]) },
   { label: "Soirs de semaine", build: (t) => nextDays(t, 14, [1, 2, 3, 4]) },
@@ -253,10 +261,24 @@ export default function CreateForm() {
             Mes sondages
           </p>
           {history.map((h) => (
-            <a key={h.id} href={`/e/${h.id}`}>
-              <span>{h.title}</span>
-              <span className="muted small">{h.admin ? "organisé par moi ›" : "›"}</span>
-            </a>
+            <div key={h.id} className="history-row">
+              <a href={`/e/${h.id}`}>
+                <span>{h.title}</span>
+                <span className="muted small">{h.admin ? "organisé par moi ›" : "›"}</span>
+              </a>
+              <button
+                type="button"
+                className="history-x"
+                aria-label={`Retirer « ${h.title} » de ma liste`}
+                title="Retirer de ma liste"
+                onClick={() => {
+                  removeHistory(h.id);
+                  setHistory(getHistory());
+                }}
+              >
+                ×
+              </button>
+            </div>
           ))}
         </div>
       )}
