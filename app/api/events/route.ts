@@ -1,9 +1,18 @@
 import { NextResponse } from "next/server";
-import { createEvent } from "@/lib/store";
+import { createEvent, getMeta, storageMissing } from "@/lib/store";
 import { randomId } from "@/lib/id";
 import { isValidDateKey, todayKey } from "@/lib/dates";
 
 export async function POST(req: Request) {
+  if (storageMissing) {
+    return NextResponse.json(
+      {
+        error:
+          "Base de données non configurée : ajoute Upstash Redis dans l'onglet Storage de ton projet Vercel, puis redéploie.",
+      },
+      { status: 503 }
+    );
+  }
   let body: unknown;
   try {
     body = await req.json();
@@ -38,14 +47,24 @@ export async function POST(req: Request) {
 
   const id = randomId(8);
   const adminToken = randomId(16);
-  await createEvent({
-    id,
-    title: cleanTitle,
-    dates: uniq,
-    finalDate: null,
-    createdAt: Date.now(),
-    adminToken,
-  });
+  try {
+    await createEvent({
+      id,
+      title: cleanTitle,
+      dates: uniq,
+      finalDate: null,
+      createdAt: Date.now(),
+      adminToken,
+    });
+    // Vérifie que le sondage est bien relisible avant de rediriger
+    if (!(await getMeta(id))) throw new Error("relecture impossible");
+  } catch (e) {
+    console.error("[cale] Échec de l'enregistrement :", e);
+    return NextResponse.json(
+      { error: "Impossible d'enregistrer le sondage (base de données inaccessible). Réessaie dans un instant." },
+      { status: 500 }
+    );
+  }
 
   return NextResponse.json({ id, adminToken }, { status: 201 });
 }
